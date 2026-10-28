@@ -1,0 +1,4 @@
+{
+  "/page": "app/page.js",
+  "/api/cron/crawl/route": "app/api/cron/crawl/route.js"
+}
