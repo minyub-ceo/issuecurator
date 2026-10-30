@@ -1,4 +1,4 @@
-// File: C:\Users\Minyub\Desktop\이슈큐레이터\app\api\cron\crawl\route.ts
+// File: C:\Users\smedi\Downloads\이슈큐레이터\app\api\cron\crawl\route.ts
 import * as entry from '../../../../../../app/api/cron/crawl/route.js'
 import type { NextRequest } from 'next/server.js'
 

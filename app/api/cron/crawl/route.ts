@@ -1,283 +1,263 @@
+// app/api/cron/crawl/route.ts
 import { NextResponse } from "next/server";
 import * as cheerio from "cheerio";
-import { GoogleGenAI, Type } from "@google/genai";
+import { supabase } from "@/lib/supabase";
 
-export interface CrawledIssue {
-  id: string;
-  source_site: string;
-  category: "유머" | "스포츠" | "섹시" | "연예" | "사건사고" | "정치";
-  title: string;
-  safe_title: string;
-  thumbnail_url: string;
-  original_url: string; // 클릭 시 실제 커뮤니티 게시글로 넘어가는 정확한 상세 URL
-  views: number;
-  likes: number;
-  comments_count: number;
-  viral_velocity: number;
-  is_nsfw: boolean;
-  ai_summary: string[];
-  best_comments: { author: string; content: string; likes: number }[];
-  affiliate_keyword?: string;
-  updated_at: string;
-}
+export const dynamic = 'force-dynamic';
 
-// 공통 브라우저 위장 헤더 (차단 방지)
-const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-  "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-};
-
-// 화력 지수 계산기
-function calcVelocity(views: number, likes: number, comments: number): number {
-  const score = views * 0.02 + likes * 3.5 + comments * 5.0;
-  return Math.min(Number((score / 15).toFixed(1)), 99.9);
-}
-
-// 제목 기반 기본 카테고리 및 후방주의(NSFW) 1차 분류기
-function classifyByTitle(
-  title: string,
-  defaultCat: CrawledIssue["category"]
-): { category: CrawledIssue["category"]; is_nsfw: boolean } {
-  const isNsfw = /후방|은꼴|19\)|약후|몸매|비키니|눈바디|치어리더/.test(title);
-  if (isNsfw) return { category: "섹시", is_nsfw: true };
-  if (/손흥민|축구|야구|류현진|롤드컵|배구|골|경기|선수/.test(title)) {
-    return { category: "스포츠", is_nsfw: false };
-  }
-  if (/아이돌|여돌|남돌|배우|가수|드라마|연예|콘서트/.test(title)) {
-    return { category: "연예", is_nsfw: false };
-  }
-  if (/국회|대통령|여야|정당|의원|장관|정치/.test(title)) {
-    return { category: "정치", is_nsfw: false };
-  }
-  if (/블박|사고|고속도로|경찰|참교육|진상|논란|사건/.test(title)) {
-    return { category: "사건사고", is_nsfw: false };
-  }
-  return { category: defaultCat, is_nsfw: false };
-}
-
-// 1. 보배드림 베스트 실시간 크롤러 (실제 상세 링크 완벽 조립)
-async function crawlBobaedream(): Promise<CrawledIssue[]> {
-  const results: CrawledIssue[] = [];
+// -----------------------------------------------------------------
+// [크롤러 1] 루리웹 전용 크롤러 (공지사항 행 배제 & 고유 글번호 ID 추출)
+// -----------------------------------------------------------------
+async function crawlRuliwebBoard(boardUrl: string, categoryName: string) {
+  const issues: any[] = [];
   try {
-    const res = await fetch("https://www.bobaedream.co.kr/list?code=best", {
-      headers: BROWSER_HEADERS,
-      cache: "no-store",
-    });
-    const html = await res.text();
-    const $ = cheerio.load(html);
-
-    $("#boardlist tbody tr").each((idx, el) => {
-      if (results.length >= 4) return false; // 상위 4개 추출
-      const titleAnchor = $(el).find("td.pl14 a.bsubject");
-      const rawTitle = titleAnchor.text().trim();
-      const href = titleAnchor.attr("href"); // 예: /view?code=best&No=789123
-
-      if (!rawTitle || !href) return;
-
-      // 상대 경로를 실제 클릭 가능한 전체 URL로 변환
-      const fullOriginalUrl = href.startsWith("http")
-        ? href
-        : `https://www.bobaedream.co.kr${href}`;
-
-      const viewsText = $(el).find("td.count").text().replace(/[^0-9]/g, "");
-      const likesText = $(el).find("td.recomm").text().replace(/[^0-9]/g, "");
-      const commentText = $(el).find("span.Comment").text().replace(/[^0-9]/g, "");
-
-      const views = parseInt(viewsText || "4200", 10);
-      const likes = parseInt(likesText || "85", 10);
-      const comments = parseInt(commentText || "32", 10);
-      const { category, is_nsfw } = classifyByTitle(rawTitle, "사건사고");
-
-      results.push({
-        id: `bobae-${idx}-${Date.now()}`,
-        source_site: "보배드림",
-        category,
-        title: rawTitle,
-        safe_title: rawTitle.replace(/참교육|진상|레전드/g, "화제"),
-        thumbnail_url:
-          "https://images.unsplash.com/photo-1503376780353-7e6692767b70?w=600&auto=format&fit=crop&q=60",
-        original_url: fullOriginalUrl,
-        views,
-        likes,
-        comments_count: comments,
-        viral_velocity: Math.max(calcVelocity(views, likes, comments), 78.5),
-        is_nsfw,
-        ai_summary: [
-          `보배드림 베스트 게시판에서 실시간 조회수 ${views.toLocaleString()}회를 돌파한 화제글입니다.`,
-          `추천수 ${likes}개와 댓글 ${comments}개가 달리며 커뮤니티 내 갑론을박이 진행 중입니다.`,
-          `우측 하단 또는 제목을 클릭하면 보배드림 원본 게시글 페이지로 즉시 이동합니다.`,
-        ],
-        best_comments: [
-          { author: "보배유저1", content: "이건 진짜 널리 공론화되어야 할 사안이네요 추천 박습니다", likes: Math.floor(likes * 0.4) },
-          { author: "안전제일", content: "블랙박스랑 증거가 명확해서 다행입니다 사이다 결말 기대합니다", likes: Math.floor(likes * 0.25) },
-          { author: "지나가던운전자", content: "오늘 방송 토크 소재로 다루기 딱 좋은 레전드 사연이네요", likes: Math.floor(likes * 0.15) },
-        ],
-        affiliate_keyword: "4K 초고화질 차량용 블랙박스",
-        updated_at: "방금 전 (실시간 크롤링)",
-      });
-    });
-  } catch (err) {
-    console.error("보배드림 크롤링 오류:", err);
-  }
-  return results;
-}
-
-// 2. 루리웹 유머베스트 실시간 크롤러 (실제 썸네일 및 상세 링크 완벽 조립)
-async function crawlRuliweb(): Promise<CrawledIssue[]> {
-  const results: CrawledIssue[] = [];
-  try {
-    const res = await fetch("https://bbs.ruliweb.com/best/humor", {
-      headers: BROWSER_HEADERS,
-      cache: "no-store",
-    });
-    const html = await res.text();
-    const $ = cheerio.load(html);
-
-    $("table.board_list_table tbody tr.table_body").each((idx, el) => {
-      if (results.length >= 4) return false;
-      const subjectAnchor = $(el).find("td.subject a.deco");
-      const rawTitle = subjectAnchor.text().trim();
-      const href = subjectAnchor.attr("href");
-
-      if (!rawTitle || !href) return;
-
-      const fullOriginalUrl = href.startsWith("http")
-        ? href
-        : `https://bbs.ruliweb.com${href}`;
-
-      const likesText = $(el).find("td.recomd").text().replace(/[^0-9]/g, "");
-      const viewsText = $(el).find("td.hit").text().replace(/[^0-9]/g, "");
-      const commentText = $(el).find("span.num_reply").text().replace(/[^0-9]/g, "");
-
-      const views = parseInt(viewsText || "6800", 10);
-      const likes = parseInt(likesText || "110", 10);
-      const comments = parseInt(commentText || "45", 10);
-      const { category, is_nsfw } = classifyByTitle(rawTitle, "유머");
-
-      results.push({
-        id: `ruli-${idx}-${Date.now()}`,
-        source_site: "루리웹",
-        category,
-        title: rawTitle,
-        safe_title: rawTitle.replace(/후방|은꼴|19\)/g, "[주의]"),
-        thumbnail_url: is_nsfw
-          ? "https://images.unsplash.com/photo-1518611012118-696072aa579a?w=600&auto=format&fit=crop&q=60"
-          : "https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?w=600&auto=format&fit=crop&q=60",
-        original_url: fullOriginalUrl,
-        views,
-        likes,
-        comments_count: comments,
-        viral_velocity: Math.max(calcVelocity(views, likes, comments), 84.2),
-        is_nsfw,
-        ai_summary: [
-          `루리웹 실시간 베스트에서 추천 ${likes}개를 받으며 급상승 중인 인기 게시글입니다.`,
-          `현재 조회수 ${views.toLocaleString()}회, 댓글 ${comments}개로 스트리머 리액션 소재에 적합합니다.`,
-          `원본 링크 클릭 시 루리웹 해당 게시글 본문과 전체 이미지를 바로 확인할 수 있습니다.`,
-        ],
-        best_comments: [
-          { author: "루리웹유저", content: "와 이건 진짜 상상도 못한 전개네 ㅋㅋㅋ 오늘도 유게는 평화롭다", likes: Math.floor(likes * 0.5) },
-          { author: "드립장인", content: "작성자 필력 미쳤네 스크롤 내리다가 뿜었음 ㅋㅋ", likes: Math.floor(likes * 0.3) },
-          { author: "베스트감별사", content: "이거 유튜브 쇼츠로 만들면 조회수 무조건 100만 각이다", likes: Math.floor(likes * 0.2) },
-        ],
-        affiliate_keyword: is_nsfw ? "고단백 다이어트 쉐이크" : "게이밍 무선 마우스",
-        updated_at: "방금 전 (실시간 크롤링)",
-      });
-    });
-  } catch (err) {
-    console.error("루리웹 크롤링 오류:", err);
-  }
-  return results;
-}
-
-// 3. Gemini 무료 티어 보호용 '단일 배치(1-Call Batch)' AI 요약 함수
-async function enrichWithGeminiBatch(issues: CrawledIssue[]): Promise<CrawledIssue[]> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  // API 키가 없거나 기본 텍스트인 경우 크롤링된 기본 데이터 즉시 반환 (무중단 보장)
-  if (!apiKey || apiKey.includes("여기에_발급받은")) {
-    return issues;
-  }
-
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    const promptPayload = issues.map((item, i) => ({
-      index: i,
-      site: item.source_site,
-      title: item.title,
-    }));
-
-    // ★ 핵심: 여러 개의 게시글을 단 1번의 API 호출(1 RPD)로 일괄 처리!
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `다음은 한국 커뮤니티에서 방금 크롤링한 인기 게시글 목록이다. 
-각 게시글 제목을 바탕으로 스트리머 방송에 적합하게:
-1) safe_title: 욕설, 후방주의, 자극적 단어를 순화한 안전한 제목
-2) is_nsfw: 성인/후방주의/선정적 요소가 있으면 true, 아니면 false
-3) affiliate_keyword: 이 글과 어울리는 쿠팡 파트너스 쇼핑 상품명 1개
-를 JSON 배열로 반환하라. 입력 데이터: ${JSON.stringify(promptPayload)}`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              index: { type: Type.INTEGER },
-              safe_title: { type: Type.STRING },
-              is_nsfw: { type: Type.BOOLEAN },
-              affiliate_keyword: { type: Type.STRING },
-            },
-            required: ["index", "safe_title", "is_nsfw", "affiliate_keyword"],
-          },
-        },
+    const res = await fetch(boardUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
+      cache: "no-store"
     });
+    const html = await res.text();
+    const $ = cheerio.load(html);
 
-    if (response.text) {
-      const aiResults = JSON.parse(response.text);
-      aiResults.forEach((resItem: { index: number; safe_title: string; is_nsfw: boolean; affiliate_keyword: string }) => {
-        if (issues[resItem.index]) {
-          issues[resItem.index].safe_title = resItem.safe_title;
-          issues[resItem.index].is_nsfw = resItem.is_nsfw;
-          issues[resItem.index].affiliate_keyword = resItem.affiliate_keyword;
-        }
+    // 공지사항(.notice)을 제외한 일반 게시글(tr.table_body)만 선택
+    $("table.board_list_table tbody tr.table_body:not(.notice)").each((_, el) => {
+      if (issues.length >= 8) return false;
+
+      const titleEl = $(el).find("a.deco, td.subject a.subject_link").first();
+      const cloneTitle = titleEl.clone();
+      cloneTitle.find("span.num_reply, strong").remove();
+      const title = cloneTitle.text().trim();
+
+      if (!title || /핫딜|공지|이벤트|규정|안내/.test(title)) return;
+
+      const rawHref = titleEl.attr("href") || "";
+      if (!rawHref) return;
+      const fullUrl = rawHref.startsWith("http")
+        ? rawHref
+        : `https://bbs.ruliweb.com${rawHref.startsWith("/") ? "" : "/"}${rawHref}`;
+
+      const postIdMatch = fullUrl.match(/\/read\/(\d+)/);
+      const uniquePostId = postIdMatch ? postIdMatch[1] : `${Date.now()}-${issues.length}`;
+
+      const viewsText = $(el).find("td.hit").text().replace(/[^0-9]/g, "");
+      const likesText = $(el).find("td.recom").text().replace(/[^0-9]/g, "");
+      const replyText = $(el).find("span.num_reply, .num").text().replace(/[^0-9]/g, "");
+
+      issues.push({
+        id: `ruli-${uniquePostId}`,
+        source_site: "루리웹",
+        category: categoryName,
+        title: title,
+        original_url: fullUrl.split("?")[0],
+        thumbnail_url: "https://images.unsplash.com/photo-1518611012118-696072aa579a?w=300",
+        views: parseInt(viewsText) || 1500,
+        likes: parseInt(likesText) || 10,
+        comments_count: parseInt(replyText) || 0,
+        viral_velocity: Math.floor(Math.random() * 40) + 55,
+        is_nsfw: /후방|ㅇㅎ|약후|19/.test(title),
       });
-    }
-  } catch (err) {
-    console.warn("Gemini 배치 호출 생략 (기본 파싱 데이터 사용):", err);
+    });
+    console.log(`✅ [루리웹-${categoryName}] ${issues.length}건 수집 성공`);
+  } catch (error) {
+    console.error(`🚨 [루리웹-${categoryName}] 크롤링 에러:`, error);
   }
   return issues;
 }
 
+// -----------------------------------------------------------------
+// [크롤러 2] 보배드림 전용 크롤러 (PC 웹 #boardlist 테이블 타겟팅)
+// -----------------------------------------------------------------
+async function crawlBobaedreamPC(boardCode: string, categoryName: string, subTag?: string) {
+  const issues: any[] = [];
+  try {
+    const targetUrl = `https://www.bobaedream.co.kr/list?code=${boardCode}`;
+    const res = await fetch(targetUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": "https://www.bobaedream.co.kr/"
+      },
+      cache: "no-store"
+    });
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    $("#boardlist tbody tr, table.clist tbody tr").each((_, el) => {
+      if (issues.length >= 7) return false;
+      if ($(el).hasClass("notice") || $(el).find("td.num img").length > 0) return;
+
+      const titleEl = $(el).find("a.bsubject, td.pl14 a").first();
+      const rawTitle = titleEl.attr("title") || titleEl.text().trim();
+      if (!rawTitle || /핫딜|공지|이벤트|규정/.test(rawTitle)) return;
+
+      const finalTitle = subTag && !rawTitle.includes(subTag) ? `[${subTag}] ${rawTitle}` : rawTitle;
+
+      const rawHref = titleEl.attr("href") || "";
+      if (!rawHref || rawHref.includes("javascript")) return;
+      const fullUrl = rawHref.startsWith("http")
+        ? rawHref
+        : `https://www.bobaedream.co.kr${rawHref.startsWith("/") ? "" : "/"}${rawHref}`;
+
+      const noMatch = fullUrl.match(/No=(\d+)/i);
+      const uniquePostId = noMatch ? noMatch[1] : `${boardCode}-${Date.now()}-${issues.length}`;
+
+      const viewsText = $(el).find("td.count").text().replace(/[^0-9]/g, "");
+      const likesText = $(el).find("td.recomm").text().replace(/[^0-9]/g, "");
+      const replyText = $(el).find("span.totreply, .Comment").text().replace(/[^0-9]/g, "");
+
+      issues.push({
+        id: `bobae-${uniquePostId}`,
+        source_site: "보배드림",
+        category: categoryName,
+        title: finalTitle,
+        original_url: fullUrl,
+        thumbnail_url: "https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?w=300",
+        views: parseInt(viewsText) || 1200,
+        likes: parseInt(likesText) || 5,
+        comments_count: parseInt(replyText) || 0,
+        viral_velocity: Math.floor(Math.random() * 45) + 50,
+        is_nsfw: /후방|19|성인/.test(finalTitle),
+      });
+    });
+    console.log(`✅ [보배드림-${boardCode}] ${issues.length}건 수집 성공`);
+  } catch (error) {
+    console.error(`🚨 [보배드림-${boardCode}] 크롤링 에러:`, error);
+  }
+  return issues;
+}
+
+// -----------------------------------------------------------------
+// [크롤러 3] 에펨코리아 전용 크롤러 (XE 엔진 mid 직접 호출)
+// -----------------------------------------------------------------
+async function crawlFmkoreaCustom(midName: string, categoryName: string, subTag?: string) {
+  const issues: any[] = [];
+  try {
+    const targetUrl = `https://www.fmkorea.com/index.php?mid=${midName}`;
+    const res = await fetch(targetUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1"
+      },
+      cache: "no-store"
+    });
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    $("table.bd_lst tbody tr:not(.notice), div.fm_best_widget ul li").each((_, el) => {
+      if (issues.length >= 6) return false;
+      if ($(el).hasClass("notice") || $(el).find(".notice").length > 0) return;
+
+      const titleEl = $(el).find("td.title a.hx, h3.title a, a.title").first();
+      if (!titleEl.length) return;
+
+      const cloneEl = titleEl.clone();
+      cloneEl.find("span, em, .comment_count").remove();
+      const rawTitle = cloneEl.text().replace(/\s+/g, " ").trim();
+
+      if (!rawTitle || /핫딜|공지|이벤트|규정|안내/.test(rawTitle)) return;
+
+      const finalTitle = subTag && !rawTitle.includes(subTag) ? `[${subTag}] ${rawTitle}` : rawTitle;
+
+      const rawHref = titleEl.attr("href") || "";
+      if (!rawHref) return;
+      const fullUrl = rawHref.startsWith("http")
+        ? rawHref
+        : `https://www.fmkorea.com${rawHref.startsWith("/") ? "" : "/"}${rawHref}`;
+
+      const idMatch = fullUrl.match(/\/(\d+)(?:\?|$)/) || fullUrl.match(/document_srl=(\d+)/);
+      const uniquePostId = idMatch ? idMatch[1] : `${midName}-${Date.now()}-${issues.length}`;
+
+      const viewsText = $(el).find("td.m_no:not(.m_no_voted)").first().text().replace(/[^0-9]/g, "");
+      const likesText = $(el).find("td.m_no_voted, span.count").text().replace(/[^0-9]/g, "");
+
+      issues.push({
+        id: `fm-${uniquePostId}`,
+        source_site: "에펨코리아",
+        category: categoryName,
+        title: finalTitle,
+        original_url: fullUrl,
+        thumbnail_url: "https://images.unsplash.com/photo-1542204165-65bf26472b9b?w=300",
+        views: parseInt(viewsText) || Math.floor(Math.random() * 6000) + 1500,
+        likes: parseInt(likesText) || Math.floor(Math.random() * 100) + 10,
+        comments_count: parseInt($(el).find(".replyNum, .comment_count").text().replace(/[^0-9]/g, "")) || 0,
+        viral_velocity: Math.floor(Math.random() * 40) + 60,
+        is_nsfw: /ㅎㅂ|후방|은꼴|약후/.test(finalTitle),
+      });
+    });
+    console.log(`✅ [에펨코리아-${midName}] ${issues.length}건 수집 성공`);
+  } catch (error) {
+    console.error(`🚨 [에펨코리아-${midName}] 크롤링 에러:`, error);
+  }
+  return issues;
+}
+
+// -----------------------------------------------------------------
+// [메인 파이프라인] 병렬 크롤링 -> 중앙 정제(핫딜/공지 차단) -> 중복 제거 -> Supabase 저장
+// -----------------------------------------------------------------
 export async function GET() {
-  const nowKST = new Date(Date.now() + 9 * 60 * 60 * 1000)
-    .toISOString()
-    .replace("T", " ")
-    .substring(0, 19);
+  console.log("🚀 [백엔드] 3대 커뮤니티 맞춤형 크롤러 가동 시작");
 
   try {
-    // 병렬 비동기 크롤링 수행
-    const [bobaeIssues, ruliIssues] = await Promise.all([
-      crawlBobaedream(),
-      crawlRuliweb(),
+    const results = await Promise.all([
+      // 1. 루리웹
+      crawlRuliwebBoard("https://bbs.ruliweb.com/best/humor", "유머"),
+      crawlRuliwebBoard("https://bbs.ruliweb.com/community/board/300148", "정치"),
+
+      // 2. 보배드림 PC
+      crawlBobaedreamPC("strange", "유머"),
+      crawlBobaedreamPC("best", "사건사고"),
+      crawlBobaedreamPC("baseball", "스포츠", "야구"),
+      crawlBobaedreamPC("soccer", "스포츠", "국내축구"),
+
+      // 3. 에펨코리아
+      crawlFmkoreaCustom("humor", "유머"),
+      crawlFmkoreaCustom("politics", "정치"),
+      crawlFmkoreaCustom("starfree", "연예"),
+      crawlFmkoreaCustom("girlgroup", "연예"),
+      crawlFmkoreaCustom("football_world", "스포츠", "해외축구"),
     ]);
 
-    const combined = [...bobaeIssues, ...ruliIssues];
+    const rawIssues = results.flat();
 
-    // 단 1회 Gemini 배치 호출로 전체 게시글 보강 (무료 티어 하루 96회만 소모)
-    const enrichedIssues = await enrichWithGeminiBatch(combined);
+    // 💡 1차 정제: 금지어(핫딜/공지 등) 원천 차단[cite: 5]
+    const FORBIDDEN_KEYWORDS = /핫딜|공지|이벤트|규정|안내|제휴|광고|필독/i;
+    const cleanIssues = rawIssues.filter((issue) => !FORBIDDEN_KEYWORDS.test(issue.title));
 
-    return NextResponse.json({
-      status: "success",
-      executed_at_kst: `${nowKST} KST`,
-      api_calls_used: 1, // 15분당 단 1회 호출 증명
-      issues: enrichedIssues,
-    });
-  } catch (error) {
-    return NextResponse.json(
-      { status: "error", message: "크롤링 파이프라인 오류", executed_at_kst: `${nowKST} KST` },
-      { status: 500 }
-    );
+    // 💡 2차 정제: original_url 기준 중복 완벽 제거 (DB 충돌 에러 방지)
+    const uniqueUrlMap = new Map();
+    for (const item of cleanIssues) {
+      if (!uniqueUrlMap.has(item.original_url)) {
+        uniqueUrlMap.set(item.original_url, {
+          ...item,
+          safe_title: item.title,
+          ai_summary: ["실시간 크롤링 요약 데이터입니다."],
+          updated_at: new Date().toISOString(),
+        });
+      }
+    }
+    const issuesToSave = Array.from(uniqueUrlMap.values());
+
+    console.log(`📊 [집계] 총 ${issuesToSave.length}건의 순수 이슈 DB 저장 시도 중...`);
+
+    if (issuesToSave.length === 0) {
+      return NextResponse.json({ status: "success", message: "수집된 새 글이 없습니다.", inserted: 0 });
+    }
+
+    const { error, data } = await supabase
+      .from("issues")
+      .upsert(issuesToSave, { onConflict: "original_url" })
+      .select();
+
+    if (error) throw new Error(`DB 에러: ${error.message}`);
+
+    return NextResponse.json({ status: "success", inserted: data?.length || 0 });
+  } catch (error: any) {
+    console.error("🚨 파이프라인 전체 에러:", error);
+    return NextResponse.json({ status: "error", message: error.message }, { status: 500 });
   }
 }

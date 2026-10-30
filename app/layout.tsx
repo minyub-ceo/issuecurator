@@ -1,5 +1,6 @@
 // 🚀 [복구] app/layout.tsx (Next.js 프론트엔드 글로벌 뼈대)
 import type { Metadata, Viewport } from "next";
+// @ts-ignore
 import "./globals.css";
 
 export const metadata: Metadata = {
