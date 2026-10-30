@@ -46,6 +46,10 @@ export default function IssueCuratorDashboard() {
   const [selectedSubCategory, setSelectedSubCategory] = useState<string>("전체");
   const SPORTS_SUB_CATEGORIES = ["전체", "야구", "국내축구", "해외축구"];
 
+  // 🚀 Fix 3-1: 정렬 옵션 및 사이트 필터 상태 추가
+  const [sortOption, setSortOption] = useState<"latest" | "views" | "likes">("latest");
+  const [selectedSites, setSelectedSites] = useState<string[]>(["루리웹", "에펨코리아", "보배드림"]);
+
   const [safeMode, setSafeMode] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [hoverPreviewId, setHoverPreviewId] = useState<string | null>(null);
@@ -124,21 +128,36 @@ export default function IssueCuratorDashboard() {
     return `${m}:${s}`;
   };
 
-  // 🚀 Fix 3-1: 프론트엔드 필터 방어선 추가 (과거 핫딜/공지 데이터 화면 노출 차단)
-  const filteredIssues = issues.filter((item) => {
-    if (item.title.includes("핫딜") || item.title.includes("공지")) return false;
+  // 🚀 Fix 3-1: 사이트 토글 함수 추가
+  const toggleSite = (site: string) => {
+    setSelectedSites(prev =>
+      prev.includes(site) ? prev.filter(s => s !== site) : [...prev, site]
+    );
+  };
 
-    const matchCategory = item.category === selectedCategory;
-    const matchSearch = item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.source_site.toLowerCase().includes(searchQuery.toLowerCase());
+  // 🚀 Fix 3-2: 다중 필터 & 정렬 로직 완벽 적용
+  const filteredIssues = [...issues]
+    .filter((item) => {
+      const matchCategory = item.category === selectedCategory;
 
-    let matchSubCategory = true;
-    if (selectedCategory === "스포츠" && selectedSubCategory !== "전체") {
-      matchSubCategory = item.title.includes(selectedSubCategory) || item.title.includes(selectedSubCategory.replace("축구", "축"));
-    }
+      let matchSubCategory = true;
+      if (selectedCategory === "스포츠" && selectedSubCategory !== "전체") {
+        matchSubCategory = item.title.includes(selectedSubCategory) || item.title.includes(selectedSubCategory.replace("축구", "축"));
+      }
 
-    return matchCategory && matchSearch && matchSubCategory;
-  });
+      const matchSite = selectedSites.includes(item.source_site);
+
+      const isClean = !item.title.includes("핫딜") && !item.title.includes("공지");
+      const matchSearch = item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        item.source_site.toLowerCase().includes(searchQuery.toLowerCase());
+
+      return matchCategory && matchSubCategory && matchSite && isClean && matchSearch;
+    })
+    .sort((a, b) => {
+      if (sortOption === "views") return b.views - a.views;
+      if (sortOption === "likes") return b.likes - a.likes;
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
 
   const handleCategoryChange = (category: Category) => {
     setSelectedCategory(category);
@@ -263,6 +282,38 @@ export default function IssueCuratorDashboard() {
 
         <main className="flex-1 max-w-[1300px] w-full px-4 lg:px-6 py-6 grid grid-cols-1 xl:grid-cols-12 gap-6">
           <section className="xl:col-span-8">
+
+            {/* 🚀 Fix 3-3: 리스트 상단 컨트롤 바 (정렬 & 커뮤니티 필터) */}
+            <div className="flex flex-wrap items-center justify-between gap-4 mb-4 bg-[#131824] p-3 rounded-xl border border-slate-800">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-400 mr-2">커뮤니티:</span>
+                {["루리웹", "에펨코리아", "보배드림"].map(site => (
+                  <label key={site} className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={selectedSites.includes(site)}
+                      onChange={() => toggleSite(site)}
+                      className="accent-indigo-500 w-3 h-3"
+                    />
+                    {site}
+                  </label>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-2 bg-slate-900 rounded-lg p-1">
+                {(["latest", "views", "likes"] as const).map(opt => (
+                  <button
+                    key={opt}
+                    onClick={() => setSortOption(opt)}
+                    className={`px-3 py-1 rounded text-[11px] font-bold transition-all ${sortOption === opt ? "bg-indigo-600 text-white shadow" : "text-slate-400 hover:text-slate-200"
+                      }`}
+                  >
+                    {opt === "latest" ? "최신순" : opt === "views" ? "조회순" : "공감순"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <div className="flex flex-col gap-2">
               {filteredIssues.map((issue, idx) => {
                 const displayTitle = safeMode ? issue.safe_title : issue.title;
@@ -289,8 +340,11 @@ export default function IssueCuratorDashboard() {
                     </div>
 
                     <div className="flex items-center gap-4 shrink-0">
+                      {/* 🚀 Fix 3-3: 조회수를 천 단위 콤마 포맷(toLocaleString)으로 변경 */}
                       <div className="hidden sm:flex items-center gap-3 text-[11px] text-slate-500 font-medium">
-                        <span className="flex items-center gap-1"><Eye className="w-3.5 h-3.5" /> {(issue.views / 1000).toFixed(1)}k</span>
+                        <span className="flex items-center gap-1">
+                          <Eye className="w-3.5 h-3.5" /> {issue.views.toLocaleString()}
+                        </span>
                         <span className="flex items-center gap-1 text-rose-400">🔥 {issue.viral_velocity}</span>
                       </div>
 
@@ -312,7 +366,7 @@ export default function IssueCuratorDashboard() {
                           {hoverPreviewId === issue.id && (
                             <div className="absolute bottom-full right-0 mb-2 w-[700px] h-[600px] max-w-[90vw] bg-[#0B0E14] border-2 border-indigo-500 rounded-xl shadow-2xl overflow-hidden z-[120] animate-in fade-in zoom-in flex flex-col origin-bottom-right">
                               <div className="bg-indigo-600 text-white text-[11px] px-3 py-1.5 flex justify-between">
-                                <span>트래픽 절감 미리보기</span>
+                                <span>미리보기</span>
                               </div>
                               <iframe
                                 src={issue.original_url}
@@ -336,7 +390,6 @@ export default function IssueCuratorDashboard() {
             </div>
           </section>
 
-          {/* 🚀 Fix 3-2: 우측 사이드바 10개 나열 및 상하 간격 70% 축소 */}
           <aside className="xl:col-span-4 space-y-4">
             <div className="bg-[#131824] border border-slate-800 rounded-2xl p-4 sticky top-24">
 

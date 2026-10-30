@@ -1,12 +1,12 @@
-// app/api/cron/crawl/route.ts
 import { NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 import { supabase } from "@/lib/supabase";
+import crypto from "crypto";
 
 export const dynamic = 'force-dynamic';
 
 // -----------------------------------------------------------------
-// [크롤러 1] 루리웹 전용 크롤러 (공지사항 행 배제 & 고유 글번호 ID 추출)
+// [크롤러 1] 루리웹 전용 크롤러 (공지 배제 & 제목 클렌징 완벽 적용)
 // -----------------------------------------------------------------
 async function crawlRuliwebBoard(boardUrl: string, categoryName: string) {
   const issues: any[] = [];
@@ -21,14 +21,16 @@ async function crawlRuliwebBoard(boardUrl: string, categoryName: string) {
     const html = await res.text();
     const $ = cheerio.load(html);
 
-    // 공지사항(.notice)을 제외한 일반 게시글(tr.table_body)만 선택
     $("table.board_list_table tbody tr.table_body:not(.notice)").each((_, el) => {
       if (issues.length >= 8) return false;
 
-      const titleEl = $(el).find("a.deco, td.subject a.subject_link").first();
+      // 🚀 Fix 2: 루리웹 제목 클렌징 (숫자 및 댓글수 완벽 제거)
+      const titleEl = $(el).find("td.subject a.deco:not(.reply_num)").first();
       const cloneTitle = titleEl.clone();
       cloneTitle.find("span.num_reply, strong").remove();
-      const title = cloneTitle.text().trim();
+
+      let title = cloneTitle.text().replace(/\s+/g, " ").trim();
+      title = title.replace(/^\d+\s*/, "").replace(/\s*\(\d+\)$/, "").trim();
 
       if (!title || /핫딜|공지|이벤트|규정|안내/.test(title)) return;
 
@@ -128,23 +130,24 @@ async function crawlBobaedreamPC(boardCode: string, categoryName: string, subTag
 }
 
 // -----------------------------------------------------------------
-// [크롤러 3] 에펨코리아 전용 크롤러 (XE 엔진 mid 직접 호출)
-// -----------------------------------------------------------------
+// [크롤러 3] 에펨코리아 전용 크롤러 (Cloudflare Worker 리버스 프록시 적용)
+// 🚀 [수정] crawlFmkoreaCustom 함수 내부: URL 오염 방지 및 순수 문자열 조립
 async function crawlFmkoreaCustom(midName: string, categoryName: string, subTag?: string) {
   const issues: any[] = [];
   try {
-    const targetUrl = `https://www.fmkorea.com/index.php?mid=${midName}`;
-    const res = await fetch(targetUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Upgrade-Insecure-Requests": "1"
-      },
-      cache: "no-store"
-    });
+    const originalUrl = `https://www.fmkorea.com/index.php?mid=${midName}`;
+
+    // 💡 찌꺼기 문자열이 들어가지 않도록 순수 도메인만 엄격하게 지정
+    const myWorkerProxy = "https://fmkorea-proxy.seaminyub.workers.dev";
+    const targetUrl = `${myWorkerProxy}/?url=${encodeURIComponent(originalUrl)}`;
+
+    const res = await fetch(targetUrl, { cache: "no-store" });
+
+    if (!res.ok) {
+      console.warn(`⚠️ [에펨코리아-${midName}] 워커 응답 에러 (${res.status})`);
+      return [];
+    }
+
     const html = await res.text();
     const $ = cheerio.load(html);
 
@@ -170,13 +173,13 @@ async function crawlFmkoreaCustom(midName: string, categoryName: string, subTag?
         : `https://www.fmkorea.com${rawHref.startsWith("/") ? "" : "/"}${rawHref}`;
 
       const idMatch = fullUrl.match(/\/(\d+)(?:\?|$)/) || fullUrl.match(/document_srl=(\d+)/);
-      const uniquePostId = idMatch ? idMatch[1] : `${midName}-${Date.now()}-${issues.length}`;
+      const postId = idMatch ? idMatch[1] : `${Date.now()}${Math.floor(Math.random() * 1000)}`;
 
       const viewsText = $(el).find("td.m_no:not(.m_no_voted)").first().text().replace(/[^0-9]/g, "");
       const likesText = $(el).find("td.m_no_voted, span.count").text().replace(/[^0-9]/g, "");
 
       issues.push({
-        id: `fm-${uniquePostId}`,
+        id: `fm-${midName}-${postId}`,
         source_site: "에펨코리아",
         category: categoryName,
         title: finalTitle,
@@ -203,37 +206,55 @@ export async function GET() {
   console.log("🚀 [백엔드] 3대 커뮤니티 맞춤형 크롤러 가동 시작");
 
   try {
-    const results = await Promise.all([
-      // 1. 루리웹
+    const ruliAndBobaeResults = await Promise.all([
       crawlRuliwebBoard("https://bbs.ruliweb.com/best/humor", "유머"),
       crawlRuliwebBoard("https://bbs.ruliweb.com/community/board/300148", "정치"),
-
-      // 2. 보배드림 PC
       crawlBobaedreamPC("strange", "유머"),
       crawlBobaedreamPC("best", "사건사고"),
-      crawlBobaedreamPC("baseball", "스포츠", "야구"),
-      crawlBobaedreamPC("soccer", "스포츠", "국내축구"),
+      crawlBobaedreamPC("politic", "정치"),
 
-      // 3. 에펨코리아
-      crawlFmkoreaCustom("humor", "유머"),
-      crawlFmkoreaCustom("politics", "정치"),
-      crawlFmkoreaCustom("starfree", "연예"),
-      crawlFmkoreaCustom("girlgroup", "연예"),
-      crawlFmkoreaCustom("football_world", "스포츠", "해외축구"),
+      // 💡 [핵심] 보배드림 스포츠 세부 종목별 독립 엔드포인트 호출
+      crawlBobaedreamPC("sports&info3=%EA%B5%AD%EB%82%B4%EC%95%BC%EA%B5%AC", "스포츠", "야구"),
+      crawlBobaedreamPC("sports&info3=%ED%95%B4%EC%99%B8%EC%B6%95%EA%B5%AC", "스포츠", "해외축구"),
+      crawlBobaedreamPC("sports&info3=%EA%B5%AD%EB%82%B4%EC%B6%95%EA%B5%AC", "스포츠", "국내축구"),
     ]);
 
-    const rawIssues = results.flat();
+    const fmCategories = [
+      { mid: "humor", cat: "유머" },
+      { mid: "politics", cat: "정치" },
+      { mid: "starfree", cat: "연예" },
+      { mid: "girlgroup", cat: "연예" },
+      { mid: "football_world", cat: "스포츠", sub: "해외축구" }
+    ];
 
-    // 💡 1차 정제: 금지어(핫딜/공지 등) 원천 차단[cite: 5]
+    const fmResults: any[] = [];
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    for (const fm of fmCategories) {
+      console.log(`⏳ 에펨코리아(${fm.mid}) 워커 요청 전 1초 대기...`);
+      await delay(1000);
+      const data = await crawlFmkoreaCustom(fm.mid, fm.cat, fm.sub);
+      fmResults.push(data);
+    }
+
+    const rawIssues = [...ruliAndBobaeResults.flat(), ...fmResults.flat()];
+
     const FORBIDDEN_KEYWORDS = /핫딜|공지|이벤트|규정|안내|제휴|광고|필독/i;
     const cleanIssues = rawIssues.filter((issue) => !FORBIDDEN_KEYWORDS.test(issue.title));
 
-    // 💡 2차 정제: original_url 기준 중복 완벽 제거 (DB 충돌 에러 방지)
+    // 🚀 Fix 1: 2차 정제: original_url 기준 중복 제거 시 '?'를 보존하여 보배드림 링크 파손 방지
     const uniqueUrlMap = new Map();
     for (const item of cleanIssues) {
-      if (!uniqueUrlMap.has(item.original_url)) {
-        uniqueUrlMap.set(item.original_url, {
+      const pureUrl = item.original_url.split('#')[0];
+
+      if (!uniqueUrlMap.has(pureUrl)) {
+        const hash = crypto.createHash('sha256').update(pureUrl).digest('hex').substring(0, 16);
+        const prefix = item.source_site === '루리웹' ? 'rl' : item.source_site === '에펨코리아' ? 'fm' : 'bb';
+
+        uniqueUrlMap.set(pureUrl, {
           ...item,
+          id: `${prefix}-${hash}`,
+          original_url: pureUrl, // 정상적인 쿼리가 포함된 URL 저장
           safe_title: item.title,
           ai_summary: ["실시간 크롤링 요약 데이터입니다."],
           updated_at: new Date().toISOString(),
